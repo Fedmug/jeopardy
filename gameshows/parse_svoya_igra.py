@@ -38,8 +38,8 @@ editorial conventions were reverse-engineered from the sample page):
   an audio clip plus a reveal image for a "cat in the bag" question).
 """
 
-import requests
 import argparse
+import requests
 import json
 import os
 import re
@@ -52,9 +52,9 @@ WIKI_BASE = "https://gameshows.ru"
 
 ROUND_NAME_TO_NUMBER = {
     "Первый раунд": 1,
+    "Второй раунд": 2,
     "Синий раунд": 1,
     "Красный раунд": 2,
-    "Второй раунд": 2,
     "Третий раунд": 3,
     "Финальный раунд": "final",
 }
@@ -592,15 +592,29 @@ def parse_svoya_igra(html_content, year, index):
                 flush_current()
                 in_game_section = False
                 break
-            continue
-
-        if not in_game_section:
+            elif in_game_section:
+                # Some other h2 (e.g. "Интересный факт", "См. также")
+                # showing up after we've already been collecting rounds -
+                # the game content is over, flush and stop.
+                flush_current()
+                in_game_section = False
+                break
             continue
 
         if tag.name == "h3":
-            flush_current()
             heading_text = _clean_text(tag.get_text())
-            current_round = ROUND_NAME_TO_NUMBER.get(heading_text, current_round)
+            if heading_text not in ROUND_NAME_TO_NUMBER:
+                # Not a round boundary - e.g. some pages insert an aside
+                # heading like "Общая сумма двух проведённых игр" between
+                # the last round's <h3> and its actual paragraphs. Treat it
+                # as noise: don't touch whatever block is currently being
+                # collected, and don't require an explicit "Ход игры" h2 to
+                # have been seen first (some pages omit it entirely).
+                continue
+            if not in_game_section:
+                in_game_section = True
+            flush_current()
+            current_round = ROUND_NAME_TO_NUMBER[heading_text]
             if heading_text == "Финальный раунд":
                 current_topic = None
                 current_price = None
@@ -608,6 +622,9 @@ def parse_svoya_igra(html_content, year, index):
                 # start collecting paragraphs for it right away
                 have_pending_heading = True
                 current_block_tags = []
+            continue
+
+        if not in_game_section:
             continue
 
         if tag.name == "h4":
@@ -705,9 +722,9 @@ def main(argv=None):
             continue
 
         if args.start <= numeric_key <= args.end:
-            if os.path.exists(os.path.join(dataset_root, key)):
-                print(f"[{key}] skipping (already exists)")
-                continue
+            # if os.path.exists(os.path.join(dataset_root, key)):
+            #     print(f"[{key}] skipping (already exists)")
+            #     continue
             review_html = requests.get(game_data['link'], headers=headers, timeout=10).text
             questions = parse_svoya_igra(review_html, int(game_data['date'][-4:]), key)
             print(f"in game {key} parsed {len(questions)} questions")
