@@ -3,7 +3,7 @@ Parser for "Своя игра" (Russian Jeopardy!) review pages (wiki-style HTML
 
 Usage:
     from parse_svoya_igra import parse_svoya_igra
-    entries = parse_svoya_igra(html_content, year=2004, index="01-03")
+    entries = parse_svoya_igra(html_content, air_date='21-04-2004', index=678)
 
 This writes datasets_ru/{index}/question.json (the full list of entries) and
 downloads any referenced audio/images into that same folder, in addition to
@@ -61,8 +61,25 @@ ROUND_NAME_TO_NUMBER = {
 
 CAT_MARKER = "Кот в мешке"
 AUCTION_MARKER = "Вопрос-аукцион"
+SVOYA_IGRA_MARKER = "Своя игра"
 
 NBSP = "\xa0"
+
+# Some (mostly older) pages append a subtitle to the round heading, e.g.
+# "Финальный раунд «Своя игра»" instead of a plain "Финальный раунд". Match
+# on a word boundary right after the known round name instead of requiring
+# an exact match, so these variants are still recognized as round headings.
+ROUND_HEADING_RE = re.compile(
+    r"^(" + "|".join(re.escape(name) for name in ROUND_NAME_TO_NUMBER) + r")\b"
+)
+
+
+def _match_round_heading(heading_text):
+    """Return the round number/tag for a heading, or None if it isn't one."""
+    m = ROUND_HEADING_RE.match(heading_text)
+    if not m:
+        return None
+    return ROUND_NAME_TO_NUMBER[m.group(1)]
 
 
 # --------------------------------------------------------------------------
@@ -104,6 +121,78 @@ def _split_topic_price(heading_text):
     topic = m.group(1).strip()
     price = _parse_price(m.group(2))
     return topic, price
+
+
+# --------------------------------------------------------------------------
+# "Вопросы от…" special topic handling
+# --------------------------------------------------------------------------
+#
+# The "Вопросы от…" ("Questions from...") topic doesn't reveal its actual
+# subject in the <h4> heading (it's always literally "Вопросы от…"); instead
+# the real subject is announced in an intro sentence like "Вопросы задаёт
+# психолог-гипнотерапевт Олеся Фоминых." or "Вопросы по теме «Европа» задаёт
+# ...". That sentence should become the entry's topic (not part of the
+# question text), and it sometimes precedes a second same-topic/price
+# <figure> right before the real question, which would otherwise cause it to
+# be mis-parsed as its own bogus, answer-less entry.
+
+QUESTIONS_FROM_PREFIX = "Вопросы от"
+
+ANNOUNCER_RE = re.compile(
+    r"^Вопрос(?:ы)?(?:\s+по\s+теме\s*«(?P<theme>[^»]+)»)?\s+задаёт\s+(?P<who>.+?)\.?\s*$"
+)
+
+# Matches a trailing personal name (2-3 capitalized words) at the end of the
+# announcer's "who" phrase, e.g. "... Олеся Фоминых" or "... Анастасия
+# Чернобровина", so it can be stripped to leave just the profession/role.
+_NAME_TAIL_RE = re.compile(r"\s+(?:[А-ЯЁ][а-яё]+\s+){1,2}[А-ЯЁ][а-яё]+\.?$")
+
+
+def _strip_trailing_name(text):
+    return _NAME_TAIL_RE.sub("", text).strip()
+
+
+def _ru_genitive_word(word):
+    """
+    Very rough heuristic Russian genitive singular for a single word,
+    covering the common noun/adjective endings seen in profession names
+    (e.g. "психолог" -> "психолога", "ведущий" -> "ведущего"). Not a full
+    morphological analyzer -- good enough for topic-naming purposes only.
+    """
+    if word.endswith("ий") or word.endswith("ый"):
+        return word[:-2] + "его"
+    if word.endswith("ой"):
+        return word[:-2] + "ого"
+    if word.endswith("й"):
+        return word[:-1] + "я"
+    if word.endswith("ь"):
+        return word[:-1] + "я"
+    if word.endswith("а"):
+        return word[:-1] + "ы"
+    if word.endswith("я"):
+        return word[:-1] + "и"
+    return word + "а"
+
+
+def _ru_genitive_phrase(phrase):
+    """
+    Decline just the (possibly hyphenated) head word of `phrase`, leaving
+    any trailing dependent words untouched (they're normally already in the
+    correct case in the source text, e.g. "программы «Устами младенца»").
+    """
+    head, _, rest = phrase.partition(" ")
+    declined_head = "-".join(_ru_genitive_word(w) for w in head.split("-"))
+    return f"{declined_head} {rest}".strip()
+
+
+def _topic_from_announcer(theme, who):
+    """Derive the real topic name from an ANNOUNCER_RE match's groups."""
+    if theme:
+        return theme.strip()
+    profession = _strip_trailing_name(who) or who.strip()
+    if re.search(r"географ", profession, re.IGNORECASE):
+        return "Вопросы от РГО"
+    return f"Вопросы от {_ru_genitive_phrase(profession)}"
 
 
 def _filename_from_title(title):
@@ -381,6 +470,10 @@ def _extract_tag_and_strip(question_text):
         tag = "auction"
         question_text = question_text.replace(AUCTION_MARKER + ".", "")
         question_text = question_text.replace(AUCTION_MARKER, "")
+    elif SVOYA_IGRA_MARKER in question_text:
+        tag = "svoya_igra"
+        question_text = question_text.replace(SVOYA_IGRA_MARKER + ".", "")
+        question_text = question_text.replace(SVOYA_IGRA_MARKER, "")
     question_text = re.sub(r"\s+", " ", question_text).strip()
     if tag == "cat":
         # "Кот в мешке" questions restate their (already-captured-in-`topic`)
@@ -444,6 +537,20 @@ def _build_question_and_answer(block_tags):
             extracted_topic = m.group(1).strip().rstrip(".")
             lines = lines[1:]
 
+    if lines:
+        # Collapse any embedded newlines/extra whitespace (the source HTML
+        # is sometimes manually line-wrapped inside a single text node)
+        # before matching, so the announcer sentence is still recognized
+        # regardless of how it's wrapped.
+        candidate = re.sub(r"\s+", " ", lines[0]).strip()
+        m = ANNOUNCER_RE.match(candidate)
+        if m:
+            # "Вопросы от…" intro line, e.g. "Вопросы задаёт психолог-
+            # гипнотерапевт Олеся Фоминых." -- names the real topic and
+            # isn't part of the question itself.
+            extracted_topic = _topic_from_announcer(m.group("theme"), m.group("who"))
+            lines = lines[1:]
+
     split_idx = len(lines)
     for i, line in enumerate(lines):
         if _is_marker_line(line):
@@ -474,7 +581,7 @@ def _build_question_and_answer(block_tags):
 # top level parse
 # --------------------------------------------------------------------------
 
-def parse_svoya_igra(html_content, year, index):
+def parse_svoya_igra(html_content, air_date, index, download_content=True):
     """
     Parse a single game's review page HTML, return the list of question
     dicts, AND persist them as JSON to disk.
@@ -483,7 +590,7 @@ def parse_svoya_igra(html_content, year, index):
         datasets_ru/{index}/question.json   <- the full list of entries
         datasets_ru/{index}/<filename>      <- any downloaded audio/images
 
-    `year` tags each entry with the game year. `index` identifies the game
+    `air_date` tags each entry with the game air date. `index` identifies the game
     (e.g. "01-03" for RU-SI-2004-01-03) and is used as the output subfolder
     name.
 
@@ -503,7 +610,7 @@ def parse_svoya_igra(html_content, year, index):
     """
     soup = BeautifulSoup(html_content, "html.parser")
 
-    output_dir = os.path.join(os.getcwd(), "dataset_ru", str(index))
+    output_dir = os.path.join("../dataset_ru", str(index))
     os.makedirs(output_dir, exist_ok=True)
 
     all_tags = soup.find_all(["h2", "h3", "h4", "p", "ul", "figure"])
@@ -519,6 +626,12 @@ def parse_svoya_igra(html_content, year, index):
     have_pending_heading = False
     carried_media = []  # media (audio/images) waiting to attach to the next real entry
 
+    # Once a "Вопросы от…" heading's real topic has been resolved (from its
+    # announcer sentence), every other price tier for the same guest reuses
+    # the literal "Вопросы от…" heading text without repeating the intro, so
+    # remember the resolved name here and reuse it for the rest of the round.
+    active_from_topic_name = None
+
     def download_media(media_list):
         filenames = []
         for m in media_list:
@@ -527,12 +640,12 @@ def parse_svoya_igra(html_content, year, index):
                 continue
             filenames.append(fn)
             url = m.get("url")
-            if url:
+            if url and download_content:
                 _download_file(url, os.path.join(output_dir, fn))
         return filenames
 
     def flush_current():
-        nonlocal carried_media, current_block_tags, have_pending_heading
+        nonlocal carried_media, current_block_tags, have_pending_heading, active_from_topic_name
         if not have_pending_heading:
             return
         if not current_block_tags:
@@ -551,7 +664,13 @@ def parse_svoya_igra(html_content, year, index):
 
         topic = current_topic
         price = current_price
-        if topic is None and parsed.get("extracted_topic"):
+        if topic is not None and topic.startswith(QUESTIONS_FROM_PREFIX):
+            if parsed.get("extracted_topic"):
+                topic = parsed["extracted_topic"]
+                active_from_topic_name = topic
+            elif active_from_topic_name:
+                topic = active_from_topic_name
+        elif topic is None and parsed.get("extracted_topic"):
             topic = parsed["extracted_topic"]
 
         if not parsed["question"] and not parsed["answer"]:
@@ -567,7 +686,7 @@ def parse_svoya_igra(html_content, year, index):
         content_filenames = download_media(media_list)
 
         entry = {
-            "year": year,
+            "air_date": air_date,
             "topic": topic,
             "price": price,
             "round": current_round,
@@ -603,19 +722,22 @@ def parse_svoya_igra(html_content, year, index):
 
         if tag.name == "h3":
             heading_text = _clean_text(tag.get_text())
-            if heading_text not in ROUND_NAME_TO_NUMBER:
+            round_number = _match_round_heading(heading_text)
+            if round_number is None:
                 # Not a round boundary - e.g. some pages insert an aside
                 # heading like "Общая сумма двух проведённых игр" between
-                # the last round's <h3> and its actual paragraphs. Treat it
-                # as noise: don't touch whatever block is currently being
+                # the last round's <h3> and its actual paragraphs, or a
+                # round summary heading like "Итог раунда". Treat it as
+                # noise: don't touch whatever block is currently being
                 # collected, and don't require an explicit "Ход игры" h2 to
                 # have been seen first (some pages omit it entirely).
                 continue
             if not in_game_section:
                 in_game_section = True
             flush_current()
-            current_round = ROUND_NAME_TO_NUMBER[heading_text]
-            if heading_text == "Финальный раунд":
+            current_round = round_number
+            active_from_topic_name = None
+            if heading_text.startswith("Финальный раунд"):
                 current_topic = None
                 current_price = None
                 # no <h4> precedes the final round's single question, so
@@ -648,6 +770,40 @@ def parse_svoya_igra(html_content, year, index):
             fc_topic, fc_price = _split_topic_price(fc_text) if fc_text else (None, None)
 
             if fc_price is not None:
+                same_question_reveal = (
+                    current_topic is not None
+                    and current_topic.startswith(QUESTIONS_FROM_PREFIX)
+                    and fc_topic == current_topic
+                    and fc_price == current_price
+                )
+                if same_question_reveal:
+                    # A "Вопросы от…" heading whose real question is
+                    # revealed further down: this figure's caption is just
+                    # "Вопросы от… (price)" again (same topic/price as the
+                    # heading), not an actual new question. If an intro/
+                    # announcer paragraph was collected before it (e.g.
+                    # "Вопросы по теме «Европа» задаёт..."), extract its
+                    # topic hint instead of letting it flush as a bogus,
+                    # answer-less entry, and keep collecting the real
+                    # question under the same heading.
+                    if current_block_tags:
+                        parsed = _build_question_and_answer(current_block_tags)
+                        if not parsed["question"] and not parsed["answer"]:
+                            if parsed.get("extracted_topic"):
+                                current_topic = parsed["extracted_topic"]
+                                active_from_topic_name = current_topic
+                            carried_media = carried_media + parsed["media"]
+                        else:
+                            # Unexpected real content already present -
+                            # flush normally rather than silently dropping it.
+                            flush_current()
+                    current_block_tags = []
+                    filename, url = _find_figure_image(tag)
+                    if filename:
+                        carried_media = carried_media + [{"filename": filename, "url": url}]
+                    have_pending_heading = True
+                    continue
+
                 # This figure marks the real start of a "Кот в мешке"
                 # question: flush (and likely just carry-forward, since it
                 # rarely has real text) whatever the current heading had
@@ -702,6 +858,7 @@ def main(argv=None):
     )
     parser.add_argument("--start", type=int, required=True, help="Start key (inclusive)")
     parser.add_argument("--end", type=int, required=True, help="End key (inclusive)")
+    parser.add_argument("--media", action=argparse.BooleanOptionalAction, default=True, help="Download media files")
     args = parser.parse_args(argv)
 
     if args.start > args.end:
@@ -709,7 +866,7 @@ def main(argv=None):
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     games_path = os.path.join(script_dir, "games.json")
-    dataset_root = os.path.join(script_dir, "dataset_ru")
+    # dataset_root = os.path.join(os.path.pardir(script_dir), "dataset_ru")
 
     with open(games_path, "r", encoding="utf-8") as f:
         games = json.load(f)
@@ -726,7 +883,8 @@ def main(argv=None):
             #     print(f"[{key}] skipping (already exists)")
             #     continue
             review_html = requests.get(game_data['link'], headers=headers, timeout=10).text
-            questions = parse_svoya_igra(review_html, int(game_data['date'][-4:]), key)
+            air_date = "-".join(game_data['date'].split('-')[::-1])
+            questions = parse_svoya_igra(review_html, air_date, key, args.media)
             print(f"in game {key} parsed {len(questions)} questions")
     return 0
 
